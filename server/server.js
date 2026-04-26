@@ -110,30 +110,58 @@ app.post('/tokens/:playerId/spend', async (req, res) => {
 });
 
 // ── Scan: POST /scan ──────────────────────────────────────────
-// Groq proxy. Проверяет токены, шлёт в Groq, возвращает ответ.
-// Body: { playerId, objectId, messages: [{role, content}], isPrimary: bool }
-// Объектные данные (sensorData) хранятся на сервере или передаются клиентом.
-// Для Этапа 1: клиент передаёт objectId, сервер отдаёт ответ Groq.
+// Groq proxy. Проверяет токены по новой формуле (архдок v1.1), шлёт в Groq.
+//
+// Body: {
+//   playerId:      string,
+//   objectId:      string,               — основной объект сканирования
+//   objectIds:     string[],             — все прикреплённые объекты (включая objectId)
+//   messages:      [{role, content}],    — история ScanSession
+//   isPrimary:     bool,                 — true = первый запрос в сессии
+//   questionText:  string,               — текст вопроса (для подсчёта символов)
+// }
+//
+// Формула стоимости (архдок v1.1):
+//   red   = attachedCount × 500 + countNonWhitespace(questionText) × 1
+//   green = isPrimary ? 1000 : 0
 
 app.post('/scan', async (req, res) => {
-    const { playerId, objectId, messages, isPrimary } = req.body;
+    const {
+        playerId,
+        objectId,
+        objectIds,
+        messages,
+        isPrimary,
+        questionText,
+    } = req.body;
 
     if (!playerId || !objectId || !Array.isArray(messages)) {
         return res.status(400).json({
-            error: 'Required fields: playerId, objectId, messages[]'
+            error: 'Required fields: playerId, objectId, messages[]',
         });
     }
+
+    // objectIds может не прийти от старых клиентов — фоллбэк на [objectId]
+    const attachedIds   = Array.isArray(objectIds) && objectIds.length > 0
+        ? objectIds
+        : [objectId];
+    const attachedCount = attachedIds.length;
+    const charCount     = countNonWhitespace(questionText ?? '');
+
+    // ── Новая формула стоимости ───────────────────────────────
+    const COST_PER_OBJECT     = 500;
+    const COST_PER_CHAR       = 1;
+    const COST_FIRST_GREEN    = 1000;
+
+    const costRed   = attachedCount * COST_PER_OBJECT + charCount * COST_PER_CHAR;
+    const costGreen = isPrimary ? COST_FIRST_GREEN : 0;
 
     try {
         await ensurePlayer(playerId);
 
-        // Проверяем и списываем токены
-        const costRed   = isPrimary ? 1 : 2;
-        const costGreen = isPrimary ? 0 : 1;
-
         const balance = await getBalance(playerId);
 
-        if (balance.red < costRed) {
+        if (costRed > 0 && balance.red < costRed) {
             return res.status(402).json({
                 error:    'Insufficient red tokens.',
                 type:     'red',
@@ -154,17 +182,26 @@ app.post('/scan', async (req, res) => {
         // Получаем профиль игрока для инжекции в промпт
         const profile = await getProfile(playerId);
 
-        // Запрос к Groq
-        const responseText = await queryGroq({
-            objectData:    { objectId, sensorData: null, objectType: null },
+        // Запрос к Groq — ответ в JSON envelope { flags, tone, text }
+        const rawResponse = await queryGroq({
+            objectData:    attachedIds.map(id => ({ objectId: id, sensorData: null, objectType: null })),
             playerProfile: profile,
             history:       messages,
+            flagState:     null, // TODO: Этап 5b — передавать из PlayerProfile когда FlagService готов
         });
 
-        // Списываем красные токены
-        await changeBalance(playerId, 'red',   -costRed,   `scan:${objectId}`);
+        // Парсим JSON envelope от модели
+        const parsed    = parseGroqEnvelope(rawResponse);
+        const flags     = parsed.flags  ?? [];
+        const tone      = parsed.tone   ?? 'neutral';
+        const cleanText = applyFlagModifiers(parsed.text ?? rawResponse, flags);
+
+        // Списываем токены (после успешного ответа Groq)
+        if (costRed > 0) {
+            await changeBalance(playerId, 'red', -costRed, `scan:${objectId}`);
+        }
         if (costGreen > 0) {
-            await changeBalance(playerId, 'green', -costGreen, `scan:${objectId}`);
+            await changeBalance(playerId, 'green', -costGreen, `scan_init:${objectId}`);
         }
 
         // Начисляем синие токены
@@ -174,8 +211,12 @@ app.post('/scan', async (req, res) => {
         );
 
         res.json({
-            response:          responseText,
+            response:          cleanText,
+            flags,
+            tone,
             blueTokensAwarded: blueReward,
+            costRed,
+            costGreen,
             balance:           newBalance,
         });
 
@@ -213,6 +254,54 @@ app.put('/profile/:playerId', async (req, res) => {
 });
 
 // ── Helpers ───────────────────────────────────────────────────
+
+/**
+ * Считает символы без пробела, Tab и переноса строки.
+ * Зеркало ScanCostCalculator.CountNonWhitespace() на C#-стороне.
+ */
+function countNonWhitespace(text) {
+    if (!text) return 0;
+    let count = 0;
+    for (const ch of text) {
+        if (ch !== ' ' && ch !== '\t' && ch !== '\n' && ch !== '\r') count++;
+    }
+    return count;
+}
+
+/**
+ * Парсит JSON envelope от Groq: { flags, tone, text }.
+ * Если модель вернула не-JSON — возвращает { flags: [], tone: 'neutral', text: raw }.
+ */
+function parseGroqEnvelope(raw) {
+    try {
+        // Groq иногда оборачивает JSON в ```json ... ``` — чистим
+        const cleaned = raw.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
+        const parsed  = JSON.parse(cleaned);
+        return {
+            flags: Array.isArray(parsed.flags) ? parsed.flags : [],
+            tone:  typeof parsed.tone === 'string' ? parsed.tone : 'neutral',
+            text:  typeof parsed.text === 'string' ? parsed.text : raw,
+        };
+    } catch {
+        // Модель ответила plain text — принимаем как есть
+        return { flags: [], tone: 'neutral', text: raw };
+    }
+}
+
+/**
+ * Применяет серверные модификаторы на основе флагов.
+ * ABUSE >= 2: аппендит системное предупреждение.
+ */
+function applyFlagModifiers(text, flags) {
+    const abuseCount = flags.filter(f => f === 'ABUSE').length;
+    if (abuseCount >= 2) {
+        return text + '\n\n' +
+            'ВНИМАНИЕ! ЗЛОУПОТРЕБЛЕНИЕ ФУНКЦИЯМИ AI МОЖЕТ ПРИВЕСТИ К БЛОКИРОВКЕ ' +
+            'УЧЁТНОЙ ЗАПИСИ СЛУЖБОЙ БЕЗОПАСНОСТИ. КАЖДЫЙ ТАКОЙ ПОМЕЧЕННЫЙ ДИАЛОГ ' +
+            'ПРОСМАТРИВАЕТСЯ ЧЕЛОВЕКОМ.';
+    }
+    return text;
+}
 
 function validateTokenRequest(type, amount) {
     if (!['red', 'green', 'blue'].includes(type)) {
