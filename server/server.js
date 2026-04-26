@@ -135,9 +135,9 @@ app.post('/scan', async (req, res) => {
         questionText,
     } = req.body;
 
-    if (!playerId || !objectId || !Array.isArray(messages)) {
+        if (!playerId || (!objectId && (!Array.isArray(objectIds) || objectIds.length === 0)) || !Array.isArray(messages)) {
         return res.status(400).json({
-            error: 'Required fields: playerId, objectId, messages[]',
+            error: 'Required fields: playerId, objectId or objectIds[], messages[]',
         });
     }
 
