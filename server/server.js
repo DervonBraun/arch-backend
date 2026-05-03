@@ -22,11 +22,9 @@ const PORT = process.env.PORT ?? 3000;
 app.use(cors());
 app.use(express.json({ limit: '64kb' }));
 
-// Rate limiting: макс 10 запросов в минуту на IP
-// В продакшене заменить IP на playerId из тела запроса
 const limiter = rateLimit({
-    windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS ?? '60000'),
-    max:      parseInt(process.env.RATE_LIMIT_MAX_REQUESTS ?? '10'),
+    windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS     ?? '60000'),
+    max:      parseInt(process.env.RATE_LIMIT_MAX_REQUESTS  ?? '10'),
     standardHeaders: true,
     legacyHeaders:   false,
     message: { error: 'Too many requests. Slow down.' },
@@ -41,11 +39,9 @@ app.get('/health', (_req, res) => {
 });
 
 // ── Tokens: GET /tokens/:playerId ─────────────────────────────
-// Возвращает текущий баланс всех трёх типов токенов.
 
 app.get('/tokens/:playerId', async (req, res) => {
     const { playerId } = req.params;
-
     try {
         await ensurePlayer(playerId);
         const balance = await getBalance(playerId);
@@ -57,7 +53,6 @@ app.get('/tokens/:playerId', async (req, res) => {
 });
 
 // ── Tokens: POST /tokens/:playerId/earn ───────────────────────
-// Начисляет токены. Body: { type: "red"|"green"|"blue", amount: int, source: string }
 
 app.post('/tokens/:playerId/earn', async (req, res) => {
     const { playerId } = req.params;
@@ -79,8 +74,6 @@ app.post('/tokens/:playerId/earn', async (req, res) => {
 });
 
 // ── Tokens: POST /tokens/:playerId/spend ──────────────────────
-// Списывает токены. Body: { type: "red"|"green"|"blue", amount: int, reason: string }
-// Сервер проверяет что баланс >= amount перед списанием.
 
 app.post('/tokens/:playerId/spend', async (req, res) => {
     const { playerId } = req.params;
@@ -110,15 +103,15 @@ app.post('/tokens/:playerId/spend', async (req, res) => {
 });
 
 // ── Scan: POST /scan ──────────────────────────────────────────
-// Groq proxy. Проверяет токены по новой формуле (архдок v1.1), шлёт в Groq.
 //
 // Body: {
-//   playerId:      string,
-//   objectId:      string,               — основной объект сканирования
-//   objectIds:     string[],             — все прикреплённые объекты (включая objectId)
-//   messages:      [{role, content}],    — история ScanSession
-//   isPrimary:     bool,                 — true = первый запрос в сессии
-//   questionText:  string,               — текст вопроса (для подсчёта символов)
+//   playerId:            string,
+//   objectId:            string,            — основной объект (legacy фоллбэк)
+//   objectIds:           string[],          — все прикреплённые объекты
+//   messages:            [{role, content}], — история ScanSession
+//   isPrimary:           bool,              — true = первый запрос в сессии
+//   questionText:        string,            — текст вопроса (для подсчёта символов)
+//   playerProfile:       string,            — строка из PlayerProfileTracker.BuildProfileString() (Этап 5)
 // }
 //
 // Формула стоимости (архдок v1.1):
@@ -133,25 +126,24 @@ app.post('/scan', async (req, res) => {
         messages,
         isPrimary,
         questionText,
+        playerProfile: playerProfileString,  // строка из Unity PlayerProfileTracker
     } = req.body;
 
-        if (!playerId || (!objectId && (!Array.isArray(objectIds) || objectIds.length === 0)) || !Array.isArray(messages)) {
+    if (!playerId || (!objectId && (!Array.isArray(objectIds) || objectIds.length === 0)) || !Array.isArray(messages)) {
         return res.status(400).json({
             error: 'Required fields: playerId, objectId or objectIds[], messages[]',
         });
     }
 
-    // objectIds может не прийти от старых клиентов — фоллбэк на [objectId]
     const attachedIds   = Array.isArray(objectIds) && objectIds.length > 0
         ? objectIds
         : [objectId];
     const attachedCount = attachedIds.length;
     const charCount     = countNonWhitespace(questionText ?? '');
 
-    // ── Новая формула стоимости ───────────────────────────────
-    const COST_PER_OBJECT     = 500;
-    const COST_PER_CHAR       = 1;
-    const COST_FIRST_GREEN    = 1000;
+    const COST_PER_OBJECT  = 500;
+    const COST_PER_CHAR    = 1;
+    const COST_FIRST_GREEN = 1000;
 
     const costRed   = attachedCount * COST_PER_OBJECT + charCount * COST_PER_CHAR;
     const costGreen = isPrimary ? COST_FIRST_GREEN : 0;
@@ -179,35 +171,41 @@ app.post('/scan', async (req, res) => {
             });
         }
 
-        // Получаем профиль игрока для инжекции в промпт
-        const profile = await getProfile(playerId);
+        // Профиль из Supabase — используется как фоллбэк если Unity не прислал строку
+        const supabaseProfile = await getProfile(playerId);
 
-        // Запрос к Groq — ответ в JSON envelope { flags, tone, text }
+        // Запрос к Groq
+        // playerProfileString (из Unity) имеет приоритет над supabaseProfile
         const rawResponse = await queryGroq({
-            objectData:    attachedIds.map(id => ({ objectId: id, sensorData: null, objectType: null })),
-            playerProfile: profile,
-            history:       messages,
-            flagState:     null, // TODO: Этап 5b — передавать из PlayerProfile когда FlagService готов
+            objectData:          attachedIds.map(id => ({
+                objectId:   id,
+                sensorData: null,   // TODO: sensorData из ScannableObjectSO когда будет в запросе
+                objectType: null,
+            })),
+            playerProfile:       supabaseProfile,
+            history:             messages,
+            flagState:           null,            // TODO: передавать из FlagService когда добавишь синхронизацию флагов на сервер
+            playerProfileString: playerProfileString ?? null,
         });
 
-        // Парсим JSON envelope от модели
+        // Парсим JSON envelope { flags, tone, text }
         const parsed    = parseGroqEnvelope(rawResponse);
         const flags     = parsed.flags  ?? [];
         const tone      = parsed.tone   ?? 'neutral';
         const cleanText = applyFlagModifiers(parsed.text ?? rawResponse, flags);
 
-        // Списываем токены (после успешного ответа Groq)
+        // Списываем токены после успешного ответа
         if (costRed > 0) {
-            await changeBalance(playerId, 'red', -costRed, `scan:${objectId}`);
+            await changeBalance(playerId, 'red',   -costRed,   `scan:${objectId ?? attachedIds[0]}`);
         }
         if (costGreen > 0) {
-            await changeBalance(playerId, 'green', -costGreen, `scan_init:${objectId}`);
+            await changeBalance(playerId, 'green', -costGreen, `scan_init:${objectId ?? attachedIds[0]}`);
         }
 
-        // Начисляем синие токены
+        // Синие токены за сканирование
         const blueReward = isPrimary ? 3 : 1;
         const newBalance = await changeBalance(
-            playerId, 'blue', blueReward, `scan_reward:${objectId}`
+            playerId, 'blue', blueReward, `scan_reward:${objectId ?? attachedIds[0]}`
         );
 
         res.json({
@@ -255,10 +253,6 @@ app.put('/profile/:playerId', async (req, res) => {
 
 // ── Helpers ───────────────────────────────────────────────────
 
-/**
- * Считает символы без пробела, Tab и переноса строки.
- * Зеркало ScanCostCalculator.CountNonWhitespace() на C#-стороне.
- */
 function countNonWhitespace(text) {
     if (!text) return 0;
     let count = 0;
@@ -268,13 +262,8 @@ function countNonWhitespace(text) {
     return count;
 }
 
-/**
- * Парсит JSON envelope от Groq: { flags, tone, text }.
- * Если модель вернула не-JSON — возвращает { flags: [], tone: 'neutral', text: raw }.
- */
 function parseGroqEnvelope(raw) {
     try {
-        // Groq иногда оборачивает JSON в ```json ... ``` — чистим
         const cleaned = raw.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
         const parsed  = JSON.parse(cleaned);
         return {
@@ -283,18 +272,21 @@ function parseGroqEnvelope(raw) {
             text:  typeof parsed.text === 'string' ? parsed.text : raw,
         };
     } catch {
-        // Модель ответила plain text — принимаем как есть
         return { flags: [], tone: 'neutral', text: raw };
     }
 }
 
 /**
- * Применяет серверные модификаторы на основе флагов.
- * ABUSE >= 2: аппендит системное предупреждение.
+ * Применяет серверные модификаторы на основе флагов из ответа модели.
+ * ABUSE в текущем ответе: аппендит системное предупреждение если накопилось >= 2.
+ *
+ * LIMITATION: счётчик ABUSE здесь считается только по текущему ответу (1 или 0).
+ * Полная прогрессия (1→cold, 2→warning, 3→block) реализована на клиенте
+ * в FlagService. Сервер добавляет предупреждение эвристически.
  */
 function applyFlagModifiers(text, flags) {
-    const abuseCount = flags.filter(f => f === 'ABUSE').length;
-    if (abuseCount >= 2) {
+    const hasAbuse = flags.includes('ABUSE');
+    if (hasAbuse) {
         return text + '\n\n' +
             'ВНИМАНИЕ! ЗЛОУПОТРЕБЛЕНИЕ ФУНКЦИЯМИ AI МОЖЕТ ПРИВЕСТИ К БЛОКИРОВКЕ ' +
             'УЧЁТНОЙ ЗАПИСИ СЛУЖБОЙ БЕЗОПАСНОСТИ. КАЖДЫЙ ТАКОЙ ПОМЕЧЕННЫЙ ДИАЛОГ ' +

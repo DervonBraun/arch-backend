@@ -11,16 +11,16 @@ const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
  * system[1]: профиль оператора + текущие флаги
  * system[2]: контекст объекта/объектов (sensorData из ScannableObjectSO)
  *
- * @param {object|object[]} objectData  — один объект или массив { objectId, sensorData, objectType }
- * @param {object}          playerProfile — строка из player_profiles или null
- * @param {Array}           history       — массив { role, content }
- * @param {object}          flagState     — { abuseCount, tone } или null
+ * @param {object|object[]} objectData         — один объект или массив { objectId, sensorData, objectType }
+ * @param {object}          playerProfile      — строка из player_profiles (Supabase) или null
+ * @param {Array}           history            — массив { role, content }
+ * @param {object}          flagState          — { abuseCount, tone } или null
+ * @param {string|null}     playerProfileString — готовая строка профиля из Unity (PlayerProfileTracker.BuildProfileString)
  */
-function buildMessages(objectData, playerProfile, history, flagState = null) {
+function buildMessages(objectData, playerProfile, history, flagState = null, playerProfileString = null) {
     const messages = [];
 
     // ── system[0]: роль + ОБЯЗАТЕЛЬНЫЙ формат ответа ─────────
-    // ВАЖНО: модель ДОЛЖНА вернуть JSON — это единственный контракт.
     messages.push({
         role: 'system',
         content:
@@ -40,23 +40,38 @@ function buildMessages(objectData, playerProfile, history, flagState = null) {
 
     // ── system[1]: профиль оператора + флаги ─────────────────
     {
-        const interestLevel = playerProfile?.anomaly_interest > 0.6
-            ? 'high anomaly interest'
-            : playerProfile?.anomaly_interest > 0.3
-                ? 'moderate curiosity'
-                : 'routine operational focus';
+        let profileContent;
 
-        const queryStyleDesc = playerProfile?.query_style > 0.6
-            ? 'detailed and investigative'
-            : 'brief and practical';
+        if (playerProfileString) {
+            // Unity прислал готовую строку из PlayerProfileTracker.BuildProfileString()
+            // Она уже содержит флаги, тон и все метрики — используем как есть
+            profileContent = playerProfileString;
+        } else {
+            // Фоллбэк: собираем из данных Supabase (старый путь / оффлайн)
+            const interestLevel = playerProfile?.anomaly_interest > 0.6
+                ? 'high anomaly interest'
+                : playerProfile?.anomaly_interest > 0.3
+                    ? 'moderate curiosity'
+                    : 'routine operational focus';
 
-        const hoursPlayed    = Math.round(playerProfile?.hours_played ?? 0);
-        const roomPref       = playerProfile?.room_preference ?? 'hub';
+            const queryStyleDesc = playerProfile?.query_style > 0.6
+                ? 'detailed and investigative'
+                : 'brief and practical';
 
-        // Флаги влияют на тон — инжектируем состояние
+            const hoursPlayed = Math.round(playerProfile?.hours_played ?? 0);
+            const roomPref    = playerProfile?.room_preference ?? 'hub';
+
+            profileContent =
+                `Operator profile: ${hoursPlayed}h on base. ` +
+                `Interest profile: ${interestLevel}. ` +
+                `Query style: ${queryStyleDesc}. ` +
+                `Frequent location: ${roomPref}. `;
+        }
+
+        // Флаги всегда добавляем поверх — серверная валидация важнее клиентской
         const abuseCount  = flagState?.abuseCount ?? 0;
         const currentTone = flagState?.tone        ?? 'neutral';
-        const flagContext = abuseCount > 0
+        const flagContext  = abuseCount > 0
             ? `Operator abuse flags: ${abuseCount}. Adjust tone to "${currentTone}". ` +
               (abuseCount >= 2
                   ? 'Operator has repeatedly attempted to misuse the system. Be cold and formal. '
@@ -65,26 +80,20 @@ function buildMessages(objectData, playerProfile, history, flagState = null) {
 
         messages.push({
             role: 'system',
-            content:
-                `Operator profile: ${hoursPlayed}h on base. ` +
-                `Interest profile: ${interestLevel}. ` +
-                `Query style: ${queryStyleDesc}. ` +
-                `Frequent location: ${roomPref}. ` +
-                flagContext +
-                'Adjust detail level accordingly without breaking clinical tone.',
+            content: profileContent + flagContext + 'Adjust detail level accordingly without breaking clinical tone.',
         });
     }
 
     // ── system[2]: контекст объекта(ов) ──────────────────────
     {
-        const objects = Array.isArray(objectData) ? objectData : [objectData];
+        const objects      = Array.isArray(objectData) ? objectData : [objectData];
         const validObjects = objects.filter(Boolean);
 
         if (validObjects.length > 0) {
             const objectLines = validObjects.map(o =>
                 `  - ID: ${o.objectId}` +
-                (o.sensorData  ? `, sensors: ${o.sensorData}`  : '') +
-                (o.objectType  ? `, class: ${o.objectType}`    : '')
+                (o.sensorData ? `, sensors: ${o.sensorData}` : '') +
+                (o.objectType ? `, class: ${o.objectType}`   : '')
             ).join('\n');
 
             messages.push({
@@ -109,20 +118,21 @@ function buildMessages(objectData, playerProfile, history, flagState = null) {
 /**
  * Отправляет запрос в Groq API.
  * @param {object}          params
- * @param {object|object[]} params.objectData    — { objectId, sensorData, objectType } или массив
- * @param {object}          params.playerProfile — строка из player_profiles или null
- * @param {Array}           params.history       — массив { role, content }
- * @param {object}          params.flagState     — { abuseCount, tone } или null
- * @returns {Promise<string>} сырой текст ответа (JSON envelope или plain text)
+ * @param {object|object[]} params.objectData          — { objectId, sensorData, objectType } или массив
+ * @param {object}          params.playerProfile       — строка из player_profiles (Supabase) или null
+ * @param {Array}           params.history             — массив { role, content }
+ * @param {object}          params.flagState           — { abuseCount, tone } или null
+ * @param {string|null}     params.playerProfileString — готовая строка из Unity или null
+ * @returns {Promise<string>} сырой текст ответа (JSON envelope)
  */
-export async function queryGroq({ objectData, playerProfile, history, flagState = null }) {
-    const messages = buildMessages(objectData, playerProfile, history, flagState);
+export async function queryGroq({ objectData, playerProfile, history, flagState = null, playerProfileString = null }) {
+    const messages = buildMessages(objectData, playerProfile, history, flagState, playerProfileString);
 
     const body = {
         model:       process.env.GROQ_MODEL ?? 'llama-3.1-8b-instant',
         messages,
         max_tokens:  256,
-        temperature: 0.4,  // Низкая температура для клинического тона
+        temperature: 0.4,
         stream:      false,
     };
 
@@ -132,8 +142,8 @@ export async function queryGroq({ objectData, playerProfile, history, flagState 
             'Content-Type':  'application/json',
             'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
         },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(12000),  // 12s timeout
+        body:   JSON.stringify(body),
+        signal: AbortSignal.timeout(12000),
     });
 
     if (!response.ok) {
@@ -141,7 +151,7 @@ export async function queryGroq({ objectData, playerProfile, history, flagState 
         throw new Error(`Groq API error ${response.status}: ${text}`);
     }
 
-    const data = await response.json();
+    const data    = await response.json();
     const content = data?.choices?.[0]?.message?.content;
 
     if (!content) {
